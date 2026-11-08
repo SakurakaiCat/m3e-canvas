@@ -79,6 +79,8 @@ export function Toolbar({
   onPrompt,
   onSettings,
   onLangSheet,
+  onAddPart,
+  onMore,
   tidy,
   onTidy,
   place,
@@ -115,6 +117,9 @@ export function Toolbar({
   onSettings?: () => void;
   /** phone: open the language sheet instead of the menu */
   onLangSheet?: () => void;
+  /** phone: open the parts sheet / the everything-else sheet */
+  onAddPart?: () => void;
+  onMore?: () => void;
   /** the tidy button for the screen being worked on; absent when no screen is in play */
   tidy?: TidyState;
   onTidy?: () => void;
@@ -144,7 +149,7 @@ export function Toolbar({
           position: "absolute",
           left: 0,
           right: 0,
-          top: 10,
+          top: "calc(10px + env(safe-area-inset-top))",
           display: "flex",
           justifyContent: "center",
           pointerEvents: "none",
@@ -155,32 +160,19 @@ export function Toolbar({
         <Pill p={p}>
           <IconBtn icon="undo" p={p} onClick={onUndo} disabled={!canUndo} title={t("undo", lang)} size={S} />
           <IconBtn icon="redo" p={p} onClick={onRedo} disabled={!canRedo} title={t("redo", lang)} size={S} />
-          <IconBtn icon="translate" p={p} onClick={onLangSheet} title={t("language", lang)} size={S} />
-          <IconBtn icon="palette" p={p} onClick={onSettings} title={t("settings", lang)} size={S} />
-          <GitHubLink p={p} size={S} />
-          <button
-            onClick={onPrompt}
-            title={t("copyPrompt", lang)}
-            className="m3-press"
-            style={{
-              height: S,
-              padding: "0 14px 0 10px",
-              borderRadius: S / 2,
-              border: "none",
-              background: p.primary,
-              color: p.onPrimary,
-              fontSize: 14,
-              fontWeight: 700,
-              cursor: "pointer",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-              whiteSpace: "nowrap",
-            }}
-          >
-            <Icon name="auto_awesome" size={22} />
-            {t("prompt", lang)}
-          </button>
+          {onAddPart && <IconBtn icon="add_circle" p={p} onClick={onAddPart} title={t("parts", lang)} size={S} />}
+          <IconBtn icon="play_arrow" p={p} onClick={onPreview} title={t("preview", lang)} size={S} fill />
+          {onShare && (
+            <IconBtn
+              icon={shareState === "busy" ? "hourglass_top" : "auto_awesome"}
+              p={p}
+              onClick={onShare}
+              disabled={shareState === "busy"}
+              title={shareState === "busy" ? t("askAiGenerating", lang) : t("askAi", lang)}
+              size={S}
+            />
+          )}
+          {onMore && <IconBtn icon="more_horiz" p={p} onClick={onMore} title={t("more", lang)} size={S} />}
         </Pill>
       </div>
     );

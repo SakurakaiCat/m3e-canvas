@@ -123,18 +123,19 @@ import { GitHubLink, Mode, Toolbar } from "@/components/Toolbar";
 import { LangMenu } from "@/components/Menus";
 import { AiActionKey, AiPanel, aiErrorText } from "@/components/AiPanel";
 import { TidyState, PANEL_FADE_H } from "@/components/ui";
-import { AiSettings, DEFAULT_AI, hasKey, isSecureUrl, loadAiSettings, proposeBehavior, proposeDescription, pushHistory, saveAiSettings } from "@/lib/ai";
+import { AiSettings, DEFAULT_AI, hasKey, isSecureUrl, loadAiSettings, proposeBehavior, proposeDescription, providerSpec, pushHistory, saveAiSettings } from "@/lib/ai";
 import { barSlotOf, bodyRect, carryFrame, holdsEdgeBar, maxFrameLength, minFrameLength, pullInto, stretchFrame, tidyFrame } from "@/lib/tidy";
 import { constrainModalRails, modalRailOf, updateRail } from "@/lib/rail";
 import { isProject, readProject, saveProject } from "@/lib/project";
 import { hasShareHash, readShareHash } from "@/lib/share";
 import { LoadingIndicator } from "@/components/Loading";
 import { draftDesign } from "@/lib/ai";
+import { DraftProgress, DraftLogLine } from "@/components/DraftProgress";
 import { ShareDialog } from "@/components/ShareMenu";
 import { ColorPanel } from "@/components/ColorPanel";
 import { MotionPanel, ShapePanel, TypePanel } from "@/components/ThemePanel";
 import { ThemeContext, ensureFontLoaded, ensureLangFontLoaded } from "@/lib/theme";
-import { BottomSheet, MobileActionBar, MobileInspector, MobileLang, MobileSettings } from "@/components/Mobile";
+import { BottomSheet, MobileActionBar, MobileInspector, MobileLang, MobileMenu, MobileScreens, MobileSettings } from "@/components/Mobile";
 import { ConfirmDialog, IconBtn, Segmented } from "@/components/ui";
 import { Lang, LangContext, SEED_TEXT, getLang, setGlobalLang, t, translateDefaultFrameName, translateDefaultText } from "@/lib/i18n";
 
@@ -488,7 +489,7 @@ export default function Editor({ initialLang, onReady }: { initialLang: Lang; on
     futureRef.current = futureRef.current.map((snap) => translateSnapshot(snap, next));
   };
   const [isMobile, setIsMobile] = useState(false);
-  const [sheet, setSheet] = useState<"edit" | "settings" | "lang" | null>(null);
+  const [sheet, setSheet] = useState<"edit" | "settings" | "lang" | "parts" | "ai" | "prompt" | "screens" | "more" | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   /** frame being rendered offscreen for the PNG export */
   const [exportFrame, setExportFrame] = useState<Frame | null>(null);
@@ -508,6 +509,15 @@ export default function Editor({ initialLang, onReady }: { initialLang: Lang; on
   const [ideaText, setIdeaText] = useState("");
   /** a model is drafting a design right now */
   const [draftBusy, setDraftBusy] = useState(false);
+  /** the draft progress panel: phase log, characters received, screens named so far */
+  const [draftLines, setDraftLines] = useState<DraftLogLine[]>([]);
+  const [draftChars, setDraftChars] = useState(0);
+  const [draftScreens, setDraftScreens] = useState<string[]>([]);
+  const [draftElapsed, setDraftElapsed] = useState(0);
+  /** the panel lingers a moment after the draft ends, so the last line is readable */
+  const [draftDone, setDraftDone] = useState(false);
+  const draftAbortRef = useRef<AbortController | null>(null);
+  const draftResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** the design a draft replaced, kept until the author keeps or undoes the draft */
   const [draftBefore, setDraftBefore] = useState<Doc | null>(null);
   const draftBeforeRef = useRef<Doc | null>(null);
@@ -517,6 +527,8 @@ export default function Editor({ initialLang, onReady }: { initialLang: Lang; on
   const revealTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => {
     if (revealTimer.current) clearTimeout(revealTimer.current);
+    if (draftResetTimer.current) clearTimeout(draftResetTimer.current);
+    draftAbortRef.current?.abort();
   }, []);
   const guideRef = useRef<string | null>(null);
 
@@ -2611,22 +2623,109 @@ export default function Editor({ initialLang, onReady }: { initialLang: Lang; on
     } catch {}
   };
 
+  /** one log line for the draft panel, stamped with the wall-clock time */
+  const draftLog = (text: string) => setDraftLines((ls) => [...ls, { time: new Date().toLocaleTimeString([], { hour12: false }), text }]);
+
+  /** stops the draft in flight; the aborted request lands in startDraft's catch */
+  const cancelDraft = () => draftAbortRef.current?.abort();
+
   const startDraft = async (idea: string) => {
     setShareOpen(false);
     setDraftBusy(true);
+    setDraftDone(false);
+    setDraftLines([]);
+    setDraftChars(0);
+    setDraftScreens([]);
+    setDraftElapsed(0);
+    if (draftResetTimer.current) clearTimeout(draftResetTimer.current);
+    const abort = new AbortController();
+    draftAbortRef.current = abort;
+    const started = performance.now();
+    const secs = () => ((performance.now() - started) / 1000).toFixed(1);
+    /* the stream is hot: counters refresh a few times a second, never per token */
+    const acc = { text: "", at: 0, first: 0, mark: 0, title: "" };
+    const rate = (chars: number) => Math.round(chars / Math.max((performance.now() - started) / 1000, 0.1));
+    const flush = (final = false) => {
+      const now = performance.now();
+      if (!final && now - acc.at < 250) return;
+      acc.at = now;
+      setDraftChars(acc.text.length);
+      setDraftElapsed((now - started) / 1000);
+      /* the app title becomes visible as soon as it streams past */
+      if (!acc.title) {
+        const tm = /"title"\s*:\s*"([^"]{1,60})"/.exec(acc.text);
+        if (tm) {
+          acc.title = tm[1];
+          draftLog(t("draftLogTitle", lang).replace("{name}", tm[1]));
+        }
+      }
+      /* screen names become visible as the frames part of the JSON streams past */
+      const at = acc.text.indexOf('"frames"');
+      if (at >= 0) {
+        const names: string[] = [];
+        const re = /"name"\s*:\s*"([^"]{1,60})"/g;
+        re.lastIndex = at;
+        for (let hit = re.exec(acc.text); hit && names.length < 8; hit = re.exec(acc.text)) {
+          if (!names.includes(hit[1])) names.push(hit[1]);
+        }
+        setDraftScreens(names);
+      }
+      /* a milestone line now and then keeps the log alive on slow models */
+      if (acc.text.length - acc.mark >= 4000) {
+        acc.mark = acc.text.length - (acc.text.length % 4000);
+        draftLog(t("draftLogMilestone", lang).replace("{n}", String(acc.mark)).replace("{r}", String(rate(acc.text.length))));
+      }
+    };
+    const tick = window.setInterval(() => setDraftElapsed((performance.now() - started) / 1000), 250);
     try {
+      draftLog(t("draftLogPrepare", lang).replace("{n}", String(idea.trim().length)));
+      draftLog(t("draftLogConnect", lang).replace("{model}", aiSettings.model.trim() || providerSpec(aiSettings.provider).model));
       if (guideRef.current === null) {
-        const res = await fetch(`${BASE_PATH}/agent.md`);
+        draftLog(t("draftLogGuide", lang));
+        const res = await fetch(`${BASE_PATH}/agent.md`, { signal: abort.signal });
         if (!res.ok) throw new Error("guide");
         guideRef.current = await res.text();
+        draftLog(t("draftLogGuideLoaded", lang).replace("{g}", (guideRef.current.length / 1024).toFixed(1)));
       }
-      const next = await draftDesign(aiSettings, guideRef.current, idea, lang);
+      const next = await draftDesign(aiSettings, guideRef.current, idea, lang, abort.signal, (chunk) => {
+        if (!acc.first) {
+          acc.first = performance.now();
+          draftLog(t("draftLogFirstChunk", lang).replace("{s}", secs()));
+        }
+        acc.text += chunk;
+        flush();
+      });
+      flush(true);
+      setDraftElapsed((performance.now() - started) / 1000);
+      draftLog(t("draftLogReceived", lang).replace("{n}", String(acc.text.length)).replace("{s}", secs()).replace("{r}", String(rate(acc.text.length))));
+      draftLog(t("draftLogParse", lang).replace("{n}", String(acc.text.length)));
+      const parts = next.groups.reduce((n, g) => n + g.items.length, 0);
+      draftLog(t("draftLogParsed", lang).replace("{title}", next.title?.trim() || acc.title || "…").replace("{k}", String(next.frames.length)).replace("{m}", String(parts)));
       arrive(next);
+      draftLog(t("draftLogDone", lang));
     } catch (e) {
-      const m = e instanceof Error ? e.message : "";
-      showToast(m === "json" ? t("aiErrorJson", lang) : m === "refusal" ? t("aiErrorRefusal", lang) : m === "long" ? t("aiErrorLong", lang) : t("aiError", lang), 3200, "error");
+      if (abort.signal.aborted) {
+        draftLog(t("draftLogCancelled", lang).replace("{n}", String(acc.text.length)));
+        showToast(t("draftLogCancelled", lang).replace("{n}", String(acc.text.length)), 2200);
+      } else {
+        const text = e instanceof Error && (e.message === "json" || e.message === "refusal" || e.message === "long" || e.message === "guide")
+          ? t(e.message === "json" ? "aiErrorJson" : e.message === "refusal" ? "aiErrorRefusal" : e.message === "long" ? "aiErrorLong" : "aiError", lang)
+          : aiErrorText(e, lang);
+        draftLog(t("draftLogFailed", lang).replace("{error}", text));
+        showToast(text, 3200, "error");
+      }
     } finally {
+      window.clearInterval(tick);
+      draftAbortRef.current = null;
       setDraftBusy(false);
+      /* the panel folds away only after the last line has had a moment on screen */
+      setDraftDone(true);
+      draftResetTimer.current = setTimeout(() => {
+        setDraftDone(false);
+        setDraftLines([]);
+        setDraftChars(0);
+        setDraftScreens([]);
+      }, 1600);
     }
   };
   /** true after a kept draft until the author undoes something, so the header's undo also sits by the opener */
@@ -4579,7 +4678,7 @@ export default function Editor({ initialLang, onReady }: { initialLang: Lang; on
             note={aiNote}
             onSaveProject={() => saveProject(doc)}
             onOpenProject={() => projectFileRef.current?.click()}
-            onShare={!isMobile ? () => setShareOpen(true) : undefined}
+            onShare={() => setShareOpen(true)}
             shareState={draftBusy ? "busy" : draftBefore ? "review" : "idle"}
             onDraftKeep={keepDraft}
             onDraftUndo={undoDraft}
@@ -4587,6 +4686,8 @@ export default function Editor({ initialLang, onReady }: { initialLang: Lang; on
             quickUndo={quickUndo}
             rightInset={showRight ? rightW : 0}
             mobile={isMobile}
+            onAddPart={() => setSheet(sheet === "parts" ? null : "parts")}
+            onMore={() => setSheet(sheet === "more" ? null : "more")}
             onSettings={() => setSheet(sheet === "settings" ? null : "settings")}
             onLangSheet={() => setSheet(sheet === "lang" ? null : "lang")}
             onPrompt={async () => {
@@ -4616,9 +4717,9 @@ export default function Editor({ initialLang, onReady }: { initialLang: Lang; on
             </div>
           )}
 
-          {isMobile && sheet === null && (
+          {isMobile && sheet === null && !draftBusy && (
             <button
-              onClick={() => addPart("button")}
+              onClick={() => setSheet("parts")}
               title={t("addButton", lang)}
               aria-label={t("addButton", lang)}
               className="m3-press"
@@ -4682,6 +4783,87 @@ export default function Editor({ initialLang, onReady }: { initialLang: Lang; on
                     changeLanguage(l);
                     setSheet(null);
                   }}
+                />
+              </BottomSheet>
+            )}
+            {isMobile && sheet === "parts" && (
+              <BottomSheet key="parts" p={p} onClose={() => setSheet(null)}>
+                <div style={{ height: "56vh" }}>
+                  <PartsPalette
+                    palette={p}
+                    favorites={favorites}
+                    onToggleFavorite={(k) =>
+                      setFavorites((f) =>
+                        f.includes(k) ? f.filter((x) => x !== k) : [...f, k],
+                      )
+                    }
+                    onPartPointerDown={() => {}}
+                    onPartActivate={(k) => {
+                      addPart(k);
+                      setSheet(null);
+                    }}
+                  />
+                </div>
+              </BottomSheet>
+            )}
+            {isMobile && sheet === "ai" && (
+              <BottomSheet key="ai" p={p} onClose={() => setSheet(null)}>
+                <AiPanel p={p} settings={aiSettings} onSettings={updateAiSettings} />
+              </BottomSheet>
+            )}
+            {isMobile && sheet === "prompt" && (
+              <BottomSheet key="prompt" p={p} onClose={() => setSheet(null)}>
+                <div style={{ height: "56vh" }}>
+                  <PromptPanel
+                    doc={doc}
+                    widths={widths}
+                    palette={p}
+                    onCover={setPromptCoverUp}
+                    onDoc={(patch) => {
+                      if (patch.title !== undefined) setTitle(patch.title);
+                      if (patch.brief !== undefined) setBrief(patch.brief);
+                      if ("promptEdit" in patch) setPromptEdit(patch.promptEdit);
+                      if ("promptOptions" in patch) setPromptOptions(patch.promptOptions);
+                      if ("platform" in patch) setPlatform(isPlatform(patch.platform) ? patch.platform : null);
+                    }}
+                  />
+                </div>
+              </BottomSheet>
+            )}
+            {isMobile && sheet === "screens" && (
+              <BottomSheet key="screens" p={p} onClose={() => setSheet(null)}>
+                <MobileScreens
+                  palette={p}
+                  frames={doc.frames}
+                  selectedId={selectedFrameId}
+                  onSelect={(id) => {
+                    setSelectedFrameId(id);
+                    setSheet(null);
+                  }}
+                  onRename={(id, name) => patchFrame(id, { name })}
+                  onDelete={(id) => {
+                    deleteFrame(id);
+                    if (selectedFrameId === id) setSelectedFrameId(null);
+                  }}
+                  onAdd={addFrame}
+                />
+              </BottomSheet>
+            )}
+            {isMobile && sheet === "more" && (
+              <BottomSheet key="more" p={p} onClose={() => setSheet(null)}>
+                <MobileMenu
+                  palette={p}
+                  rows={[
+                    { icon: "download", label: t("saveProject", lang), onClick: () => { saveProject(doc); setSheet(null); } },
+                    { icon: "upload", label: t("openProject", lang), onClick: () => { projectFileRef.current?.click(); setSheet(null); } },
+                    { icon: "filter_none", label: t("screens", lang), onClick: () => setSheet("screens") },
+                    { icon: "auto_awesome", label: t("askAi", lang), onClick: () => { setSheet(null); setShareOpen(true); } },
+                    { icon: "key", label: t("aiSettings", lang), onClick: () => setSheet("ai") },
+                    { icon: "description", label: t("prompt", lang), onClick: () => setSheet("prompt") },
+                    { icon: "translate", label: t("language", lang), onClick: () => setSheet("lang") },
+                    { icon: "palette", label: t("settings", lang), onClick: () => setSheet("settings") },
+                    { icon: "delete_sweep", label: t("clearAll", lang), onClick: () => { if (groupsRef.current.length || framesRef.current.length) { setSheet(null); setConfirmClear(true); } }, danger: true },
+                  ]}
                 />
               </BottomSheet>
             )}
@@ -4905,6 +5087,17 @@ export default function Editor({ initialLang, onReady }: { initialLang: Lang; on
             setLeftOpen(true);
             setLeftTab("ai");
           }}
+        />
+
+        <DraftProgress
+          p={p}
+          open={draftBusy || draftDone}
+          model={aiSettings.model.trim() || providerSpec(aiSettings.provider).model}
+          lines={draftLines}
+          chars={draftChars}
+          elapsed={draftElapsed}
+          screens={draftScreens}
+          onCancel={cancelDraft}
         />
 
 

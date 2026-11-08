@@ -1533,7 +1533,7 @@ export function Preview({
         style={
           wide
             ? { position: "absolute", right: 20, bottom: 20, display: "flex", alignItems: "flex-end", pointerEvents: "none" }
-            : { position: "absolute", left: 0, right: 0, bottom: 14, display: "flex", justifyContent: "center", pointerEvents: "none" }
+            : { position: "absolute", left: 0, right: 0, bottom: "calc(14px + env(safe-area-inset-bottom))", display: "flex", justifyContent: "center", pointerEvents: "none" }
         }
       >
         <div

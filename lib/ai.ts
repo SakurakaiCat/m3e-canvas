@@ -75,8 +75,36 @@ async function readError(res: Response): Promise<string> {
   return `${res.status} ${res.statusText}${detail ? `: ${detail.slice(0, 300)}` : ""}`;
 }
 
-/** one round trip: a system prompt and a user message in, the model's text out */
-export async function complete(s: AiSettings, system: string, user: string, signal?: AbortSignal, maxTokens = 4096): Promise<string> {
+/** reads a server-sent-events body, handing every `data:` payload to `onEvent` */
+async function readSse(res: Response, onEvent: (data: string) => void): Promise<void> {
+  const body = res.body;
+  if (!body) throw new Error("stream");
+  const reader = body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let end: number;
+      while ((end = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, end);
+        buf = buf.slice(end + 2);
+        for (const line of chunk.split(/\r?\n/)) {
+          const m = line.match(/^data:\s?(.*)$/);
+          if (m) onEvent(m[1]);
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/** one round trip: a system prompt and a user message in, the model's text out.
+ *  With `onDelta` the answer streams: the callback receives each text piece as it arrives. */
+export async function complete(s: AiSettings, system: string, user: string, signal?: AbortSignal, maxTokens = 4096, onDelta?: (text: string) => void): Promise<string> {
   const base = trimSlash(s.baseUrl);
   const model = s.model.trim();
   if (!model) throw new Error("model");
@@ -91,16 +119,52 @@ export async function complete(s: AiSettings, system: string, user: string, sign
         "anthropic-version": "2023-06-01",
         "anthropic-dangerous-direct-browser-access": "true",
       },
-      body: JSON.stringify({ model, max_tokens: Math.min(maxTokens, 8192), system, messages: [{ role: "user", content: user }] }),
+      body: JSON.stringify({
+        model,
+        max_tokens: Math.min(maxTokens, 8192),
+        system,
+        messages: [{ role: "user", content: user }],
+        ...(onDelta ? { stream: true } : {}),
+      }),
     });
     if (!res.ok) throw new Error(await readError(res));
-    const j = await res.json();
-    if (j.stop_reason === "refusal") throw new Error("refusal");
-    if (j.stop_reason === "max_tokens") throw new Error("long");
-    return (j.content ?? [])
-      .filter((b: { type: string }) => b.type === "text")
-      .map((b: { text: string }) => b.text)
-      .join("");
+    if (!onDelta) {
+      const j = await res.json();
+      if (j.stop_reason === "refusal") throw new Error("refusal");
+      if (j.stop_reason === "max_tokens") throw new Error("long");
+      return (j.content ?? [])
+        .filter((b: { type: string }) => b.type === "text")
+        .map((b: { text: string }) => b.text)
+        .join("");
+    }
+    let text = "";
+    let stop = "";
+    let failed = "";
+    await readSse(res, (data) => {
+      if (data === "[DONE]") return;
+      let e: {
+        type?: string;
+        delta?: { type?: string; text?: string; stop_reason?: string };
+        error?: { message?: string };
+      };
+      try {
+        e = JSON.parse(data);
+      } catch {
+        return;
+      }
+      if (e.type === "content_block_delta" && e.delta?.type === "text_delta" && typeof e.delta.text === "string") {
+        text += e.delta.text;
+        onDelta(e.delta.text);
+      } else if (e.type === "message_delta" && e.delta?.stop_reason) {
+        stop = e.delta.stop_reason;
+      } else if (e.type === "error") {
+        failed = e.error?.message || "error";
+      }
+    });
+    if (failed) throw new Error(failed);
+    if (stop === "refusal") throw new Error("refusal");
+    if (stop === "max_tokens") throw new Error("long");
+    return text;
   }
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (s.key.trim()) headers.authorization = `Bearer ${s.key.trim()}`;
@@ -113,6 +177,7 @@ export async function complete(s: AiSettings, system: string, user: string, sign
       /* OpenAI's newer models refuse `max_tokens` and default generously, so they get no budget;
          the other compatible endpoints cap around 8k */
       ...(s.provider === "openai" ? {} : { max_tokens: Math.min(maxTokens, 8192) }),
+      ...(onDelta ? { stream: true } : {}),
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
@@ -120,12 +185,33 @@ export async function complete(s: AiSettings, system: string, user: string, sign
     }),
   });
   if (!res.ok) throw new Error(await readError(res));
-  const j = await res.json();
-  if (j.choices?.[0]?.finish_reason === "length") throw new Error("long");
-  const c = j.choices?.[0]?.message?.content;
-  if (typeof c === "string") return c;
-  if (Array.isArray(c)) return c.map((x: { text?: string }) => x.text ?? "").join("");
-  throw new Error("empty");
+  if (!onDelta) {
+    const j = await res.json();
+    if (j.choices?.[0]?.finish_reason === "length") throw new Error("long");
+    const c = j.choices?.[0]?.message?.content;
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) return c.map((x: { text?: string }) => x.text ?? "").join("");
+    throw new Error("empty");
+  }
+  let text = "";
+  let finish = "";
+  await readSse(res, (data) => {
+    if (data === "[DONE]") return;
+    let e: { choices?: { delta?: { content?: string }; finish_reason?: string }[] };
+    try {
+      e = JSON.parse(data);
+    } catch {
+      return;
+    }
+    const c = e.choices?.[0];
+    if (typeof c?.delta?.content === "string") {
+      text += c.delta.content;
+      onDelta(c.delta.content);
+    }
+    if (c?.finish_reason) finish = c.finish_reason;
+  });
+  if (finish === "length") throw new Error("long");
+  return text;
 }
 
 /** the first JSON object in a reply, with any code fence stripped */
@@ -239,7 +325,7 @@ export function popHistory<V extends string, H extends string>(current: string |
 /** A whole design from an idea, drafted by the author's own model. `guide` is the same
  *  agent guide a coding agent reads (public/agent.md), so both paths follow one spec.
  *  The answer is the document itself; a link would be pointless here. */
-export async function draftDesign(s: AiSettings, guide: string, idea: string, lang: Lang, signal?: AbortSignal): Promise<Doc> {
+export async function draftDesign(s: AiSettings, guide: string, idea: string, lang: Lang, signal?: AbortSignal, onDelta?: (text: string) => void): Promise<Doc> {
   const system = [
     "You draft M3E Canvas designs. Follow the guide below exactly.",
     "Reply with the JSON document only: no share link, no prose, no markdown fence, no explanation.",
@@ -247,7 +333,7 @@ export async function draftDesign(s: AiSettings, guide: string, idea: string, la
     guide,
   ].join("\n");
   const user = [`Sketch this app: ${idea.trim()}`, `Write every label, title and note in ${LANG_NAME[lang]}.`, "Three to five screens. Keep it simple."].join("\n");
-  const j = parseJsonObject(await complete(s, system, user, signal, 12000));
+  const j = parseJsonObject(await complete(s, system, user, signal, 12000, onDelta));
   if (!isProject(j)) throw new Error("json");
   return j;
 }

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { motion, useDragControls } from "motion/react";
-import { CONTRASTS, Contrast, FONTS, Item, KIND_SPEC, NavTab, PALETTES, Palette, SHAPES, ShapeScale, Theme, defaultTabsFor, iconSlotsOf, setIconSlot } from "@/lib/tokens";
+import { CONTRASTS, Contrast, FONTS, Frame, Item, KIND_SPEC, NavTab, PALETTES, Palette, SHAPES, ShapeScale, Theme, defaultTabsFor, iconSlotsOf, setIconSlot } from "@/lib/tokens";
 import { ensureFontLoaded } from "@/lib/theme";
 import { KIND_TEXT, LANGS, Lang, t, useLang } from "@/lib/i18n";
 import { IconPicker } from "./IconPicker";
@@ -51,7 +51,7 @@ export function BottomSheet({ p, onClose, children }: { p: Palette; onClose: () 
         onPointerDown={(e) => controls.start(e)}
         aria-label={t("close", lang)}
         style={{
-          height: 30,
+          height: 44,
           border: "none",
           background: "transparent",
           display: "grid",
@@ -510,6 +510,121 @@ export function MobileSettings({
         />
       </Row>
     </div>
+  );
+}
+
+/** A menu sheet: one tappable row per entry. */
+export function MobileMenu({
+  palette: p,
+  rows,
+}: {
+  palette: Palette;
+  rows: { icon: string; label: string; onClick: () => void; danger?: boolean }[];
+}) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, padding: "4px 0" }}>
+      {rows.map((r) => (
+        <button
+          key={r.label}
+          onClick={r.onClick}
+          className="m3-press"
+          style={{
+            height: 52,
+            padding: "0 16px 0 12px",
+            borderRadius: 16,
+            border: "none",
+            background: p.surfaceContainerHigh,
+            color: r.danger ? p.error : p.onSurface,
+            fontSize: 15,
+            fontWeight: 600,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            textAlign: "left",
+          }}
+        >
+          <Icon name={r.icon} size={22} />
+          <span style={{ flex: 1 }}>{r.label}</span>
+          <Icon name="chevron_right" size={20} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** The screens sheet: switch, rename, delete and add phone screens. */
+export function MobileScreens({
+  palette: p,
+  frames,
+  selectedId,
+  onSelect,
+  onRename,
+  onDelete,
+  onAdd,
+}: {
+  palette: Palette;
+  frames: Frame[];
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+  onRename: (id: string, name: string) => void;
+  onDelete: (id: string) => void;
+  onAdd: () => void;
+}) {
+  const lang = useLang();
+  return (
+    <Row icon="filter_none" label={t("screens", lang)} p={p}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {frames.map((f, i) => {
+          const on = f.id === selectedId;
+          return (
+            <div key={f.id} style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <IconBtn
+                icon={on ? "radio_button_checked" : "radio_button_unchecked"}
+                p={p}
+                size={48}
+                on={on}
+                onClick={() => onSelect(f.id)}
+                title={t("screen", lang)}
+              />
+              <Field
+                value={f.name || `${t("screenN", lang)}${i + 1}`}
+                onChange={(name) => onRename(f.id, name)}
+                placeholder={t("screenName", lang)}
+                p={p}
+                height={48}
+              />
+              {frames.length > 1 && (
+                <IconBtn icon="delete" p={p} size={48} danger onClick={() => onDelete(f.id)} title={t("delete", lang)} />
+              )}
+            </div>
+          );
+        })}
+        <button
+          onClick={onAdd}
+          className="m3-press"
+          style={{
+            marginTop: 4,
+            height: 48,
+            width: "100%",
+            borderRadius: 24,
+            border: `1px solid ${p.outline}`,
+            background: "transparent",
+            color: p.primary,
+            fontSize: 14,
+            fontWeight: 600,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 6,
+          }}
+        >
+          <Icon name="add" size={20} />
+          {t("addFrame", lang)}
+        </button>
+      </div>
+    </Row>
   );
 }
 
